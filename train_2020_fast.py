@@ -5,7 +5,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Batch, Data
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import recall_score, f1_score, roc_auc_score, precision_score, confusion_matrix
 import matplotlib
@@ -22,7 +21,7 @@ from network_fast_transformer import ROEN_Fast_Transformer
 # ==========================================
 # 1. 稀疏图构建函数 (核心优化)
 # ==========================================
-def create_graph_data_sparse(time_slice, global_ip_map, label_encoder, time_window):
+def create_graph_data_sparse(time_slice, global_ip_map, global_subnet_ids, label_encoder, time_window):
     """
     构建稀疏图：只包含当前活跃节点，但携带全局 n_id 用于模型内部对齐
     """
@@ -68,11 +67,16 @@ def create_graph_data_sparse(time_slice, global_ip_map, label_encoder, time_wind
     # n_id 记录了这些局部节点对应的全局 ID，模型会用它来做 SearchSorted 对齐
     n_id = torch.tensor(unique_nodes, dtype=torch.long)
     
-    # 节点特征 x: 这里简单使用端口号归一化，或者全 1
-    # 为了配合 Transformer，这里初始化为 [N, 1]
-    # 如果想更强，可以把端口号映射进去，这里为了速度先用全1占位
-    # 模型会自动通过 node_enc 学习 Embedding
-    x = torch.ones((n_nodes, 1), dtype=torch.float) 
+    ones = torch.ones(edge_index.size(1), dtype=torch.float)
+    in_degrees = torch.zeros(n_nodes, dtype=torch.float)
+    out_degrees = torch.zeros(n_nodes, dtype=torch.float)
+    out_degrees.scatter_add_(0, edge_index[0], ones)
+    in_degrees.scatter_add_(0, edge_index[1], ones)
+    x = torch.stack([torch.log1p(in_degrees), torch.log1p(out_degrees)], dim=-1).float()
+
+    subnet_id = None
+    if global_subnet_ids is not None:
+        subnet_id = torch.tensor(global_subnet_ids[unique_nodes], dtype=torch.long)
     
     # 6. 边特征 (已在全局做过 Log + Scale，直接取)
     drop_cols = ['Src IP', 'Dst IP', 'Flow ID', 'Label', 'Timestamp', 'Src Port', 'Dst Port']
@@ -83,7 +87,10 @@ def create_graph_data_sparse(time_slice, global_ip_map, label_encoder, time_wind
     if edge_index.size(1) > 0:
         edge_labels = torch.tensor(labels, dtype=torch.long)
         # 注意：这里必须把 n_id 传进去
-        return Data(x=x, edge_index=edge_index, edge_attr=edge_attr, edge_labels=edge_labels, n_id=n_id)
+        data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, edge_labels=edge_labels, n_id=n_id)
+        if subnet_id is not None:
+            data.subnet_id = subnet_id
+        return data
     else:
         return None
 
@@ -123,6 +130,22 @@ from analys import evaluate_comprehensive,evaluate_with_threshold
 # ==========================================
 # 4. 主训练流程
 # ==========================================
+def temporal_split(data_list, test_size=0.2):
+    split_idx = int(len(data_list) * (1 - test_size))
+    return data_list[:split_idx], data_list[split_idx:]
+
+def _subnet_key(ip):
+    try:
+        parts = str(ip).split(".")
+        if len(parts) < 3:
+            return (0, 0, 0)
+        a = int(parts[0])
+        b = int(parts[1])
+        c = int(parts[2])
+        return (a, b, c)
+    except Exception:
+        return (0, 0, 0)
+
 def main():
     # --- 配置 ---
     SEQ_LEN = 8       # 真正启用时序 (Original Paper Logic)
@@ -184,6 +207,17 @@ def main():
     NUM_GLOBAL_NODES = len(all_ips)
     print(f"Total Global Nodes: {NUM_GLOBAL_NODES}")
 
+    subnet_to_idx = {}
+    global_subnet_ids = np.zeros(NUM_GLOBAL_NODES, dtype=np.int64)
+    for ip, gid in global_ip_map.items():
+        key = _subnet_key(ip)
+        sid = subnet_to_idx.get(key)
+        if sid is None:
+            sid = len(subnet_to_idx)
+            subnet_to_idx[key] = sid
+        global_subnet_ids[gid] = sid
+    num_subnets = len(subnet_to_idx)
+
     # --- 3. 构建稀疏图序列 ---
     print("Constructing Sparse Graphs...")
     grouped_data = data.groupby('time_idx', sort=True)
@@ -191,7 +225,7 @@ def main():
     
     for name, group in tqdm(grouped_data, desc="Building Graphs"):
         # 调用新的稀疏构建函数
-        graph = create_graph_data_sparse(group, global_ip_map, None, name) 
+        graph = create_graph_data_sparse(group, global_ip_map, global_subnet_ids, None, name) 
         # 注意：这里 label_encoder 传 None 因为我们在外部已经编码过了 data['Label']
         # 但 graph 需要 labels tensor，create_graph_data_sparse 会直接取 values
         
@@ -200,18 +234,17 @@ def main():
             
     print(f"Total Graphs: {len(graph_data_seq)}")
 
-    # --- 4. 数据集切分 (Shuffle Split) ---
-    # 为了保证每类都有，且验证模型泛化性
-    train_size = int(len(graph_data_seq) * 0.8)
-    train_seqs = graph_data_seq[:train_size]
-    test_seqs = graph_data_seq[train_size:]
+    # --- 4. 数据集切分 (Strict Temporal Split) ---
+    trainval_seqs, test_seqs = temporal_split(graph_data_seq, test_size=0.2)
+    train_seqs, val_seqs = temporal_split(trainval_seqs, test_size=0.125)
 
     # 同时建议在 TemporalGraphDataset 中保持序列的连续性
     train_dataset = TemporalGraphDataset(train_seqs, seq_len=SEQ_LEN)
-    # 测试集应与训练集在时间上完全解耦
+    val_dataset = TemporalGraphDataset(val_seqs, seq_len=SEQ_LEN)
     test_dataset = TemporalGraphDataset(test_seqs, seq_len=SEQ_LEN)
     
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=temporal_collate_fn)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=temporal_collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=temporal_collate_fn)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=temporal_collate_fn)
 
     # --- 5. 模型初始化 ---
@@ -223,10 +256,11 @@ def main():
     
     print(f"Initializing ROEN_Fast_Transformer (Edge Dim: {edge_dim})...")
     model = ROEN_Fast_Transformer(
-        node_in=1, # x 初始化为全1
+        node_in=2,
         edge_in=edge_dim,
         hidden=64, # 隐藏层维度
-        num_classes=len(class_names)
+        num_classes=len(class_names),
+        num_subnets=num_subnets
     ).to(DEVICE)
 
     # 优化器
@@ -271,11 +305,11 @@ def main():
         # 简单评估
         if (epoch + 1) % 5 == 0 or (epoch+1) == NUM_EPOCHS:
             acc, prec, rec, f1, far, auc, asa = evaluate_comprehensive(
-                model, test_loader, DEVICE, class_names
+                model, val_loader, DEVICE, class_names
             )
 
             print(
-                f"Test (Epoch {epoch+1}) -> "
+                f"Val (Epoch {epoch+1}) -> "
                 f"ACC: {acc:.4f}, F1: {f1:.4f}, Rec: {rec:.4f}, "
                 f"FAR: {far:.4f}, AUC: {auc:.4f}, ASA: {asa:.4f}"
             )
@@ -291,7 +325,7 @@ def main():
 
     for th in [0.5, 0.4, 0.3, 0.25, 0.2, 0.15]:
         acc, f1, far, asa = evaluate_with_threshold(
-            model, test_loader, DEVICE, class_names, threshold=th
+            model, val_loader, DEVICE, class_names, threshold=th
         )
         print(f"[Threshold {th}] -> ACC: {acc:.4f}, F1: {f1:.4f}, FAR: {far:.4f}, ASA: {asa:.4f}")
 
@@ -299,11 +333,13 @@ def main():
             best_asa = asa
             best_thresh = th
 
+    if best_thresh == 0.0:
+        best_thresh = 0.5
     print(f"\nBest Strategy: Use Threshold = {best_thresh}")
     print(f"Expected Impact: ASA boosts to {best_asa:.4f} (Recall improved!)")
 
-    print("\n=== Generating Final Report with Optimal Threshold (0.2) ===")
-    OPTIMAL_THRESH = 0.2
+    print("\n=== Generating Final Report with Optimal Threshold ===")
+    OPTIMAL_THRESH = best_thresh
 
     attack_indices = []
     for idx, name in enumerate(class_names):

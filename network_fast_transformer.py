@@ -25,6 +25,8 @@ class MultiHeadAttentionLayer(MessagePassing):
 
         assert out_dim % n_heads == 0, f"out_dim {out_dim} must be divisible by n_heads {n_heads}"
 
+        self.ln = nn.LayerNorm(in_dim)
+
         # 定义 Q, K, V 投影矩阵
         self.WQ = nn.Linear(in_dim, out_dim, bias=False)
         self.WK = nn.Linear(in_dim, out_dim, bias=False)
@@ -38,16 +40,19 @@ class MultiHeadAttentionLayer(MessagePassing):
             
         # 最终输出融合
         self.out_proj = nn.Linear(out_dim, out_dim)
+        self.res_proj = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
 
     def forward(self, x, edge_index, edge_attr=None):
         # x: [Num_Nodes, in_dim]
         # edge_index: [2, Num_Edges]
         # edge_attr: [Num_Edges, edge_dim]
 
+        h = self.ln(x)
+
         # 1. 线性变换并分头 [N, Heads, Head_Dim]
-        q = self.WQ(x).view(-1, self.n_heads, self.head_dim)
-        k = self.WK(x).view(-1, self.n_heads, self.head_dim)
-        v = self.WV(x).view(-1, self.n_heads, self.head_dim)
+        q = self.WQ(h).view(-1, self.n_heads, self.head_dim)
+        k = self.WK(h).view(-1, self.n_heads, self.head_dim)
+        v = self.WV(h).view(-1, self.n_heads, self.head_dim)
 
         # 2. 处理边特征
         e = None
@@ -61,7 +66,8 @@ class MultiHeadAttentionLayer(MessagePassing):
         # 4. 拼接多头并输出
         out = out.view(-1, self.out_dim)
         out = self.out_proj(out)
-        return out
+        out = F.dropout(out, p=self.dropout, training=self.training)
+        return self.res_proj(x) + out
 
     def message(self, q_i, k_j, v_j, e, index):
         # q_i: 目标节点 (Receiver) 的 Query
@@ -150,11 +156,17 @@ class TemporalInception(nn.Module):
 # 3. 主模型架构 (ROEN_Fast_Transformer)
 # ==========================================
 class ROEN_Fast_Transformer(nn.Module):
-    def __init__(self, node_in, edge_in, hidden, num_classes):
+    def __init__(self, node_in, edge_in, hidden, num_classes, num_subnets=None, subnet_emb_dim=None):
         super(ROEN_Fast_Transformer, self).__init__()
         
         # 1. 基础编码器
-        self.node_enc = nn.Linear(node_in, hidden)
+        self.subnet_emb = None
+        if num_subnets is not None and num_subnets > 0:
+            subnet_emb_dim = subnet_emb_dim if subnet_emb_dim is not None else max(4, hidden // 4)
+            self.subnet_emb = nn.Embedding(num_subnets, subnet_emb_dim)
+            self.node_enc = nn.Linear(node_in + subnet_emb_dim, hidden)
+        else:
+            self.node_enc = nn.Linear(node_in, hidden)
         self.edge_enc = nn.Linear(edge_in, edge_in) # 保留原始维度，由 Attention 层投影
         
         # 2. 空间层：使用自定义的多头注意力
@@ -194,6 +206,9 @@ class ROEN_Fast_Transformer(nn.Module):
             batch_global_ids.append(data.n_id) 
 
             # 编码
+            if self.subnet_emb is not None and hasattr(data, "subnet_id"):
+                subnet_feat = self.subnet_emb(data.subnet_id)
+                x = torch.cat([x, subnet_feat], dim=1)
             x = F.relu(self.node_enc(x))
             
             # Layer 1: Custom Attention
