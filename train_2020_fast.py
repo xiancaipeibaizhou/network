@@ -18,7 +18,7 @@ from analys import FocalLoss
 
 # 引入我们刚才定好的模型
 # from network_fast_transformer import ROEN_Fast_Transformer 
-from a1 import ImprovedROEN
+from network_fast_transformer import ROEN_Fast_Transformer
 # ==========================================
 # 1. 稀疏图构建函数 (核心优化)
 # ==========================================
@@ -202,9 +202,13 @@ def main():
 
     # --- 4. 数据集切分 (Shuffle Split) ---
     # 为了保证每类都有，且验证模型泛化性
-    train_seqs, test_seqs = train_test_split(graph_data_seq, test_size=0.2, shuffle=True, random_state=42)
-    
+    train_size = int(len(graph_data_seq) * 0.8)
+    train_seqs = graph_data_seq[:train_size]
+    test_seqs = graph_data_seq[train_size:]
+
+    # 同时建议在 TemporalGraphDataset 中保持序列的连续性
     train_dataset = TemporalGraphDataset(train_seqs, seq_len=SEQ_LEN)
+    # 测试集应与训练集在时间上完全解耦
     test_dataset = TemporalGraphDataset(test_seqs, seq_len=SEQ_LEN)
     
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=temporal_collate_fn)
@@ -218,7 +222,7 @@ def main():
         edge_dim = 1
     
     print(f"Initializing ROEN_Fast_Transformer (Edge Dim: {edge_dim})...")
-    model = ImprovedROEN(
+    model = ROEN_Fast_Transformer(
         node_in=1, # x 初始化为全1
         edge_in=edge_dim,
         hidden=64, # 隐藏层维度
