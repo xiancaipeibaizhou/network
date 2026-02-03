@@ -17,7 +17,7 @@ from analys import FocalLoss
 
 # 引入 Fast 模型
 from network_fast_transformer import ROEN_Fast_Transformer 
-
+from network_advanced import ROEN_Advanced
 # ==========================================
 # 辅助函数：子网键生成
 # ==========================================
@@ -131,7 +131,7 @@ def temporal_split(data_list, test_size=0.2):
 def main():
     SEQ_LEN = 8       
     BATCH_SIZE = 128   
-    NUM_EPOCHS = 50
+    NUM_EPOCHS = 150
     LR = 0.001
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -149,30 +149,49 @@ def main():
     print(f"Classes: {class_names}")
 
     # 归一化
-    print("Normalizing...")
+    print("Normalizing..." )
     numeric_cols = data.select_dtypes(include=[np.number]).columns.tolist()
-    exclude = ['Label', 'Timestamp', 'Src IP', 'Dst IP', 'Flow ID', 'Src Port', 'Dst Port']
-    feat_cols = [c for c in numeric_cols if c not in exclude]
+    exclude = ['Label', 'Timestamp', 'Src IP', 'Dst IP', 'Flow ID', 'Src Port', 'Dst Port' ]
+    feat_cols = [c for c in numeric_cols if c not in  exclude]
     
     data[feat_cols] = data[feat_cols].fillna(0)
     for col in feat_cols:
-        if data[col].max() > 100: data[col] = np.log1p(data[col].abs())
+        if data[col].max() > 100:
+            data[col] = np.log1p(data[col].abs())
     
     scaler = StandardScaler()
     data[feat_cols] = scaler.fit_transform(data[feat_cols])
 
-    # 时间处理 (保持原 test_nb15.py 的格式，如果不匹配请调整 format)
-    print("Processing Time...")
-    data['Timestamp'] = pd.to_datetime(data['Timestamp'], format='%d/%m/%Y %I:%M:%S %p', errors='coerce')
-    data.dropna(subset=['Timestamp'], inplace=True)
-    data = data.sort_values('Timestamp')
-    data['time_idx'] = data['Timestamp'].dt.floor('T')
+    # === 修改 1: 稳健的时间处理 ===
+    print("Processing Time..." )
+    # 移除硬编码的 format，让 pandas 自动尝试解析
+    data['Timestamp'] = pd.to_datetime(data['Timestamp'], errors='coerce' )
+    
+    # 打印诊断信息
+    before_drop = len (data)
+    data.dropna(subset=['Timestamp'], inplace=True )
+    after_drop = len (data)
+    if after_drop < before_drop * 0.1 :
+        print(f"CRITICAL WARNING: {before_drop - after_drop} rows dropped due to timestamp parsing failure!" )
+    
+    data = data.sort_values('Timestamp' )
+    # 修正 FutureWarning
+    data['time_idx'] = data['Timestamp'].dt.floor('min' )
 
-    # 全局 IP 映射 & 子网构建
-    print("Building Global Maps...")
-    all_ips = pd.concat([data['Src IP'], data['Dst IP']]).unique()
-    global_ip_map = {ip: i for i, ip in enumerate(all_ips)}
-    NUM_GLOBAL_NODES = len(all_ips)
+    # === 修改 2: 稳健的 IP 处理 ===
+    print("Building Global Maps..." )
+    # 强制转为字符串，防止因类型问题导致 map 失败
+    data['Src IP'] = data['Src IP'].astype(str).str .strip()
+    data['Dst IP'] = data['Dst IP'].astype(str).str .strip()
+
+    all_ips = pd.concat([data['Src IP'], data['Dst IP' ]]).unique()
+    global_ip_map = {ip: i for i, ip in enumerate (all_ips)}
+    NUM_GLOBAL_NODES = len (all_ips)
+    
+    print(f"Total Nodes: {NUM_GLOBAL_NODES}" )
+    if NUM_GLOBAL_NODES < 10 :
+        print("ERROR: Total nodes is still suspiciously low. Check input CSV content." )
+        return # 提前终止，避免跑出无意义的结果
     
     subnet_to_idx = {}
     global_subnet_ids = np.zeros(NUM_GLOBAL_NODES, dtype=np.int64)
@@ -213,7 +232,7 @@ def main():
         edge_dim = 1
         
     print(f"Initializing Model (Node In: 2, Subnets: {num_subnets})...")
-    model = ROEN_Fast_Transformer(
+    model = ROEN_Advanced(
         node_in=2, # 入度+出度
         edge_in=edge_dim, 
         hidden=64, 
@@ -228,7 +247,8 @@ def main():
     weights = 1.0 / (torch.sqrt(class_counts_tensor) + 1.0)
     weights = weights / weights.sum() * len(class_names)
     
-    criterion = FocalLoss(alpha=0.25, gamma=2.0) # 使用 Focal Loss 更好
+    criterion = nn.CrossEntropyLoss(weight=weights)
+    # criterion = FocalLoss(alpha=0.25, gamma=2.0) # 使用 Focal Loss 更好
     # criterion = nn.CrossEntropyLoss(weight=weights) 
     optimizer = optim.Adam(model.parameters(), lr=LR)
 
@@ -257,7 +277,7 @@ def main():
         print(f"Epoch {epoch+1} Loss: {total_loss/len(train_loader):.4f}")
         
         # 评估
-        if (epoch + 1) % 5 == 0 or (epoch+1) == NUM_EPOCHS:
+        if (epoch + 1) % 50 == 0 or (epoch+1) == NUM_EPOCHS:
             acc, prec, rec, f1, far, auc, asa = evaluate_comprehensive(
                 model, test_loader, DEVICE, class_names
             )
@@ -267,7 +287,7 @@ def main():
                 f"ACC: {acc:.4f}, F1: {f1:.4f}, Rec: {rec:.4f}, "
                 f"FAR: {far:.4f}, AUC: {auc:.4f}, ASA: {asa:.4f}"
             )
-        elif (epoch + 1) % 50 == 0:    
+        elif (epoch + 1) % 150 == 0:    
             torch.save(model.state_dict(), f'models/nb15/fast_transformer_epoch_{epoch+1}.pth')
 
     # 阈值搜索
