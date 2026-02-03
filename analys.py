@@ -7,6 +7,17 @@ from sklearn.metrics import recall_score, f1_score, roc_auc_score, precision_sco
 # ==========================================
 # 3. 评估辅助函数
 # ==========================================
+def _get_normal_indices(class_names):
+    keywords = ("non", "Non-Tor", "NonVPN", "normal", "Benign")
+    normal_indices = []
+    for idx, name in enumerate(class_names):
+        low = str(name).lower()
+        if any(k in low for k in keywords):
+            normal_indices.append(idx)
+    if len(normal_indices) == 0 and len(class_names) > 0:
+        normal_indices = [0]
+    return normal_indices
+
 def evaluate_comprehensive(model, dataloader, device, class_names):
     """
     全指标评估：Acc, Prec, Rec, F1 + FAR, AUC, ASA
@@ -16,10 +27,7 @@ def evaluate_comprehensive(model, dataloader, device, class_names):
     all_preds = []
     all_probs = []
 
-    normal_indices = []
-    for idx, name in enumerate(class_names):
-        if 'non' in name.lower():
-            normal_indices.append(idx)
+    normal_indices = _get_normal_indices(class_names)
 
     with torch.no_grad():
         for batched_seq in dataloader:
@@ -49,22 +57,27 @@ def evaluate_comprehensive(model, dataloader, device, class_names):
 
     is_true_normal = np.isin(y_true, normal_indices)
     is_pred_normal = np.isin(y_pred, normal_indices)
-
     fp = np.logical_and(is_true_normal, ~is_pred_normal).sum()
     tn = np.logical_and(is_true_normal, is_pred_normal).sum()
-    tp = np.logical_and(~is_true_normal, ~is_pred_normal).sum()
-    fn = np.logical_and(~is_true_normal, is_pred_normal).sum()
-
     far = fp / (fp + tn) if (fp + tn) > 0 else 0.0
-    asa = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    is_true_attack = ~is_true_normal
+    asa = (y_pred[is_true_attack] == y_true[is_true_attack]).mean() if is_true_attack.any() else 0.0
 
     try:
-        if len(class_names) == 2:
-            auc = roc_auc_score(y_true, y_probs[:, 1])
+        present_labels = np.unique(y_true).astype(int)
+        if y_probs.ndim != 2 or y_probs.shape[0] != y_true.shape[0] or present_labels.size < 2:
+            auc = float("nan")
+        elif y_probs.shape[1] == 2 or present_labels.size == 2:
+            present_labels = np.sort(present_labels)
+            pos_label = int(present_labels[-1])
+            y_true_bin = (y_true == pos_label).astype(int)
+            auc = roc_auc_score(y_true_bin, y_probs[:, pos_label])
         else:
-            auc = roc_auc_score(y_true, y_probs, multi_class='ovr', average='macro')
+            label_list = np.sort(present_labels).astype(int)
+            probs_subset = y_probs[:, label_list]
+            auc = roc_auc_score(y_true, probs_subset, multi_class='ovr', average='macro', labels=label_list)
     except Exception:
-        auc = 0.5
+        auc = float("nan")
 
     return acc, prec, rec, f1, far, auc, asa
 
@@ -76,14 +89,8 @@ def evaluate_with_threshold(model, dataloader, device, class_names, threshold=0.
     all_labels = []
     all_preds = []
 
-    attack_indices = []
-    normal_indices = []
-
-    for idx, name in enumerate(class_names):
-        if 'non' in name.lower():
-            normal_indices.append(idx)
-        else:
-            attack_indices.append(idx)
+    normal_indices = _get_normal_indices(class_names)
+    attack_indices = [i for i in range(len(class_names)) if i not in set(normal_indices)]
 
     print(
         f"Threshold Analysis: Normal IDs {normal_indices}, "
@@ -116,17 +123,13 @@ def evaluate_with_threshold(model, dataloader, device, class_names, threshold=0.
     y_true = np.array(all_labels)
     y_pred = np.array(all_preds)
 
-    is_true_attack = np.isin(y_true, attack_indices)
-    is_pred_attack = np.isin(y_pred, attack_indices)
-    tp = np.logical_and(is_true_attack, is_pred_attack).sum()
-    fn = np.logical_and(is_true_attack, ~is_pred_attack).sum()
-    asa = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-
     is_true_normal = np.isin(y_true, normal_indices)
     is_pred_normal = np.isin(y_pred, normal_indices)
     fp = np.logical_and(is_true_normal, ~is_pred_normal).sum()
     tn = np.logical_and(is_true_normal, is_pred_normal).sum()
     far = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+    is_true_attack = ~is_true_normal
+    asa = (y_pred[is_true_attack] == y_true[is_true_attack]).mean() if is_true_attack.any() else 0.0
 
     acc = (y_pred == y_true).mean() if len(y_true) > 0 else 0.0
     f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0) if len(y_true) > 0 else 0.0
