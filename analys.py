@@ -8,7 +8,7 @@ from sklearn.metrics import recall_score, f1_score, roc_auc_score, precision_sco
 # 3. 评估辅助函数
 # ==========================================
 def _get_normal_indices(class_names):
-    keywords = ("non", "Non-Tor", "NonVPN", "normal", "Benign")
+    keywords = ("non", "Non-Tor", "NonVPN", "normal", "benign", "non-tor", "nonvpn")
     normal_indices = []
     for idx, name in enumerate(class_names):
         low = str(name).lower()
@@ -17,6 +17,28 @@ def _get_normal_indices(class_names):
     if len(normal_indices) == 0 and len(class_names) > 0:
         normal_indices = [0]
     return normal_indices
+
+
+def _auc_ovr_macro(y_true, y_probs, present_labels):
+    y_true = np.asarray(y_true).astype(int)
+    y_probs = np.asarray(y_probs)
+    if y_probs.ndim != 2 or y_probs.shape[0] != y_true.shape[0]:
+        return 0.5
+
+    aucs = []
+    for c in np.asarray(present_labels).astype(int):
+        if c < 0 or c >= y_probs.shape[1]:
+            continue
+        y_bin = (y_true == c).astype(int)
+        if np.unique(y_bin).size < 2:
+            continue
+        try:
+            aucs.append(float(roc_auc_score(y_bin, y_probs[:, c])))
+        except Exception:
+            continue
+    if len(aucs) == 0:
+        return 0.5
+    return float(np.mean(aucs))
 
 def evaluate_comprehensive(model, dataloader, device, class_names):
     """
@@ -73,13 +95,81 @@ def evaluate_comprehensive(model, dataloader, device, class_names):
             y_true_bin = (y_true == pos_label).astype(int)
             auc = roc_auc_score(y_true_bin, y_probs[:, pos_label])
         else:
-            label_list = np.sort(present_labels).astype(int)
-            probs_subset = y_probs[:, label_list]
-            auc = roc_auc_score(y_true, probs_subset, multi_class='ovr', average='macro', labels=label_list)
+            auc = _auc_ovr_macro(y_true, y_probs, present_labels)
     except Exception:
         auc = float("nan")
 
     return acc, prec, rec, f1, far, auc, asa
+
+
+def evaluate_comprehensive_with_binary_auc(model, dataloader, device, class_names):
+    model.eval()
+    all_labels = []
+    all_preds = []
+    all_probs = []
+
+    normal_indices = _get_normal_indices(class_names)
+
+    with torch.no_grad():
+        for batched_seq in dataloader:
+            batched_seq = [g.to(device) for g in batched_seq]
+
+            preds_seq = model(graphs=batched_seq, seq_len=len(batched_seq))
+            logits = preds_seq[-1]
+
+            probs = torch.softmax(logits, dim=1)
+            preds = torch.argmax(probs, dim=1)
+
+            all_labels.extend(batched_seq[-1].edge_labels.cpu().numpy())
+            all_preds.extend(preds.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+
+    if len(all_labels) == 0:
+        return 0, 0, 0, 0, 0, 0.5, 0, 0.5
+
+    y_true = np.array(all_labels)
+    y_pred = np.array(all_preds)
+    y_probs = np.array(all_probs)
+
+    acc = (y_pred == y_true).mean()
+    prec = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+    rec = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+    f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+
+    is_true_normal = np.isin(y_true, normal_indices)
+    is_pred_normal = np.isin(y_pred, normal_indices)
+    fp = np.logical_and(is_true_normal, ~is_pred_normal).sum()
+    tn = np.logical_and(is_true_normal, is_pred_normal).sum()
+    far = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+    is_true_attack = ~is_true_normal
+    asa = (y_pred[is_true_attack] == y_true[is_true_attack]).mean() if is_true_attack.any() else 0.0
+
+    try:
+        present_labels = np.unique(y_true).astype(int)
+        if y_probs.ndim != 2 or y_probs.shape[0] != y_true.shape[0] or present_labels.size < 2:
+            auc = 0.5
+        elif y_probs.shape[1] == 2 or present_labels.size == 2:
+            present_labels = np.sort(present_labels)
+            pos_label = int(present_labels[-1])
+            y_true_bin = (y_true == pos_label).astype(int)
+            auc = roc_auc_score(y_true_bin, y_probs[:, pos_label])
+        else:
+            auc = _auc_ovr_macro(y_true, y_probs, present_labels)
+    except Exception:
+        auc = 0.5
+
+    try:
+        y_true_bin = (~np.isin(y_true, normal_indices)).astype(int)
+        normal_prob = y_probs[:, normal_indices].sum(axis=1) if len(normal_indices) > 0 else 0.0
+        attack_prob = 1.0 - normal_prob
+        if np.unique(y_true_bin).size < 2:
+            auc_bin = 0.5
+        else:
+            auc_bin = roc_auc_score(y_true_bin, attack_prob)
+    except Exception:
+        auc_bin = 0.5
+
+    return acc, prec, rec, f1, far, auc, asa, auc_bin
 
 def evaluate_with_threshold(model, dataloader, device, class_names, threshold=0.4):
     """

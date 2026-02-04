@@ -18,6 +18,7 @@ from analys import FocalLoss
 # 引入 Fast 模型
 from network_fast_transformer import ROEN_Fast_Transformer 
 from network_advanced import ROEN_Advanced
+from ROEN_Final import ROEN_Final
 # ==========================================
 # 辅助函数：子网键生成
 # ==========================================
@@ -129,8 +130,8 @@ def temporal_split(data_list, test_size=0.2):
     return data_list[:split_idx], data_list[split_idx:]
 
 def main():
-    SEQ_LEN = 8       
-    BATCH_SIZE = 128   
+    SEQ_LEN = 10       
+    BATCH_SIZE = 32   
     NUM_EPOCHS = 150
     LR = 0.001
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -165,8 +166,9 @@ def main():
     # === 修改 1: 稳健的时间处理 ===
     print("Processing Time..." )
     # 移除硬编码的 format，让 pandas 自动尝试解析
-    data['Timestamp'] = pd.to_datetime(data['Timestamp'], errors='coerce' )
-    
+    # data['Timestamp'] = pd.to_datetime(data['Timestamp'], errors='coerce' )
+    print("Parsing NB15 Timestamps (dayfirst=True)...")
+    data['Timestamp'] = pd.to_datetime(data['Timestamp'], dayfirst=True, errors='coerce')
     # 打印诊断信息
     before_drop = len (data)
     data.dropna(subset=['Timestamp'], inplace=True )
@@ -232,12 +234,15 @@ def main():
         edge_dim = 1
         
     print(f"Initializing Model (Node In: 2, Subnets: {num_subnets})...")
-    model = ROEN_Advanced(
+    # ROEN_Fast_Transformer ROEN_Advanced
+    model = ROEN_Final(
         node_in=2, # 入度+出度
         edge_in=edge_dim, 
-        hidden=64, 
+        hidden=128, 
         num_classes=len(class_names),
-        num_subnets=num_subnets
+        num_subnets=num_subnets,
+        seq_len=SEQ_LEN,
+        heads=8
     ).to(DEVICE)
     
     # 计算类别权重 (可选)

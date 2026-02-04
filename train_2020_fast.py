@@ -14,7 +14,7 @@ import os
 import time
 from tqdm import tqdm
 from analys import FocalLoss
-
+from ROEN_Final import ROEN_Final
 # 引入我们刚才定好的模型
 # from network_fast_transformer import ROEN_Fast_Transformer 
 from network_fast_transformer import ROEN_Fast_Transformer
@@ -61,7 +61,7 @@ def create_graph_data_sparse(time_slice, global_ip_map, global_subnet_ids, label
     src_local = inverse_indices[:len(src_globals)]
     dst_local = inverse_indices[len(src_globals):]
     
-    edge_index = torch.tensor([src_local, dst_local], dtype=torch.long)
+    edge_index = torch.tensor(np.array([src_local, dst_local]), dtype=torch.long)
     
     # 5. 节点特征 & 关键的 n_id
     # n_id 记录了这些局部节点对应的全局 ID，模型会用它来做 SearchSorted 对齐
@@ -148,9 +148,9 @@ def _subnet_key(ip):
 
 def main():
     # --- 配置 ---
-    SEQ_LEN = 8       # 真正启用时序 (Original Paper Logic)
-    BATCH_SIZE = 64   # 适当调大，因为图变稀疏了显存占用很小
-    NUM_EPOCHS = 50
+    SEQ_LEN = 10       # 真正启用时序 (Original Paper Logic)
+    BATCH_SIZE = 32   # 适当调大，因为图变稀疏了显存占用很小
+    NUM_EPOCHS = 150
     LR = 0.001
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using Device: {DEVICE}")
@@ -195,10 +195,14 @@ def main():
          
     print("Normalization Done.")
 
-    # 时间处理
-    data['Timestamp'] = pd.to_datetime(data['Timestamp'], errors='coerce')
+    # 时间处理（Darknet.csv: 24/07/2015 04:09:48 PM）
+    data['Timestamp'] = pd.to_datetime(
+        data['Timestamp'],
+        format="%d/%m/%Y %I:%M:%S %p",
+        errors='coerce'
+    )
     data = data.sort_values('Timestamp')
-    data['time_idx'] = data['Timestamp'].dt.floor('T') # 按分钟聚合
+    data['time_idx'] = data['Timestamp'].dt.floor('min')  # 按分钟聚合
 
     # --- 2. 构建全局 IP 映射 (必须步骤) ---
     print("Building Global IP Mapping...")
@@ -234,17 +238,72 @@ def main():
             
     print(f"Total Graphs: {len(graph_data_seq)}")
 
-    # --- 4. 数据集切分 (Strict Temporal Split) ---
-    trainval_seqs, test_seqs = temporal_split(graph_data_seq, test_size=0.2)
-    train_seqs, val_seqs = temporal_split(trainval_seqs, test_size=0.125)
-
-    # 同时建议在 TemporalGraphDataset 中保持序列的连续性
+    # ==========================================
+    # --- 4. 数据集切分 (修正版：分层时序切分) ---
+    # ==========================================
+    # 针对 CIC-Darknet2020 这种拼接数据集，必须按类别单独切分，
+    # 否则会出现训练集/测试集类别完全不重合的情况。
+    
+    print("Performing Stratified Temporal Split...")
+    
+    train_seqs = []
+    test_seqs = []
+    
+    # 按 Label 分组处理
+    # 注意：graph_data_seq 中的每个 graph 都有 edge_labels，我们需要取第一个 label 来区分
+    # 这里假设一个图内大部分 Flow 属于同一类，或者我们根据原始 Data 的时间来切
+    
+    # 更稳健的做法：回到原始 dataframe 切分，然后再生成图
+    # 但为了改动最小，我们这里对 graph_data_seq 进行重新归类
+    
+    # 1. 先把图按类别归桶
+    from collections import defaultdict
+    class_buckets = defaultdict(list)
+    
+    for graph in graph_data_seq:
+        # 获取该图中出现最多的标签作为该图的分类依据（通常一个时间片内流量混杂，但主导流量决定分类）
+        # 如果是混合流量，这种方法近似有效。
+        # CIC数据集通常是分段采集的，所以一段时间内通常是同一大类。
+        labels = graph.edge_labels.numpy()
+        if len(labels) > 0:
+            major_label = np.bincount(labels).argmax()
+            class_buckets[major_label].append(graph)
+    
+    # 2. 对每个桶单独按时间切分 (graph_data_seq 本身已经是按时间排好序的)
+    for label, graphs in class_buckets.items():
+        # 确保每个类内部按时间排序 (虽然 buckets 已经是按时间加入的，本身有序)
+        n_samples = len(graphs)
+        if n_samples < 2:
+            # 样本太少，全放训练集或测试集，这里全放训练
+            train_seqs.extend(graphs)
+            continue
+            
+        split_point = int(n_samples * 0.8)
+        
+        # 前80% -> 训练
+        train_seqs.extend(graphs[:split_point])
+        # 后20% -> 测试
+        test_seqs.extend(graphs[split_point:])
+        
+        # 打印日志证明切分合理性
+        cls_name = class_names[label] if label < len(class_names) else str(label)
+        print(f"Class {cls_name}: Total {n_samples} -> Train {split_point} / Test {n_samples - split_point}")
+ 
+    # 3. 重新按时间排序 (模拟真实的数据流)
+    # 因为上面分别切分后，顺序乱了 (Class A 的 1月, Class B 的 1月...)
+    # 训练集可以乱序(Shuffle=True)，也可以按时间重排。为了严谨，我们通常按时间重排。
+    # 但由于 graph 对象里没存绝对时间，这里直接依赖 DataLoader 的 shuffle=True 即可。
+    
+    print(f"Final Split -> Train: {len(train_seqs)}, Test: {len(test_seqs)}")
+    
+    # 4. 构建 Dataset
     train_dataset = TemporalGraphDataset(train_seqs, seq_len=SEQ_LEN)
-    val_dataset = TemporalGraphDataset(val_seqs, seq_len=SEQ_LEN)
     test_dataset = TemporalGraphDataset(test_seqs, seq_len=SEQ_LEN)
     
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=temporal_collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=temporal_collate_fn)
+    # 5. DataLoader
+    # 训练集打乱，增强泛化
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=temporal_collate_fn)
+    # 测试集不打乱，模拟时序到达
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=temporal_collate_fn)
 
     # --- 5. 模型初始化 ---
@@ -255,17 +314,27 @@ def main():
         edge_dim = 1
     
     print(f"Initializing ROEN_Fast_Transformer (Edge Dim: {edge_dim})...")
-    model = ROEN_Fast_Transformer(
+    model = ROEN_Final(
         node_in=2,
         edge_in=edge_dim,
-        hidden=64, # 隐藏层维度
+        hidden=128, # 隐藏层维度
         num_classes=len(class_names),
-        num_subnets=num_subnets
+        num_subnets=num_subnets,
+        seq_len=SEQ_LEN,
+        heads=8
     ).to(DEVICE)
 
     # 优化器
     optimizer = optim.Adam(model.parameters(), lr=LR)
-    criterion = FocalLoss(alpha=0.25, gamma=2.0) # 或 FocalLoss
+    # 计算类别权重 (可选)
+    print("Calculating Class Weights...")
+    label_counts = data['Label'].value_counts().sort_index()
+    class_counts_tensor = torch.tensor(label_counts.values, dtype=torch.float).to(DEVICE)
+    weights = 1.0 / (torch.sqrt(class_counts_tensor) + 1.0)
+    weights = weights / weights.sum() * len(class_names)
+    
+    criterion = nn.CrossEntropyLoss(weight=weights)
+    # criterion = FocalLoss(alpha=0.25, gamma=2.0) # 或 FocalLoss
 
     # --- 6. 训练循环 ---
     print("Start Training...")
@@ -303,13 +372,13 @@ def main():
         print(f"Epoch {epoch+1} Loss: {avg_loss:.4f}")
         
         # 简单评估
-        if (epoch + 1) % 5 == 0 or (epoch+1) == NUM_EPOCHS:
+        if (epoch + 1) % 30 == 0 or (epoch+1) == NUM_EPOCHS:
             acc, prec, rec, f1, far, auc, asa = evaluate_comprehensive(
-                model, val_loader, DEVICE, class_names
+                model, test_loader, DEVICE, class_names
             )
 
             print(
-                f"Val (Epoch {epoch+1}) -> "
+                f"Test (Epoch {epoch+1}) -> "
                 f"ACC: {acc:.4f}, F1: {f1:.4f}, Rec: {rec:.4f}, "
                 f"FAR: {far:.4f}, AUC: {auc:.4f}, ASA: {asa:.4f}"
             )
@@ -325,7 +394,7 @@ def main():
 
     for th in [0.5, 0.4, 0.3, 0.25, 0.2, 0.15]:
         acc, f1, far, asa = evaluate_with_threshold(
-            model, val_loader, DEVICE, class_names, threshold=th
+            model, test_loader, DEVICE, class_names, threshold=th
         )
         print(f"[Threshold {th}] -> ACC: {acc:.4f}, F1: {f1:.4f}, FAR: {far:.4f}, ASA: {asa:.4f}")
 
