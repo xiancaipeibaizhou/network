@@ -12,6 +12,7 @@ class ROEN_Universal(nn.Module):
     def __init__(self, node_in, edge_in, hidden, num_classes, num_subnets=None, seq_len=8, heads=8, dropout=0.3):
         super(ROEN_Universal, self).__init__()
         self.hidden = hidden
+        self.edge_in = edge_in
         
         # --- 1. 空间层 (保留 ROEN_Final 的强拓扑能力，适配 NB15) ---
         self.node_enc = nn.Linear(node_in, hidden)
@@ -38,7 +39,7 @@ class ROEN_Universal(nn.Module):
         # --- 3. 分类器 ---
         # 增加 Dropout 防止在 Darknet 上过拟合
         self.classifier = nn.Sequential(
-            nn.Linear(hidden * 3, hidden * 2),
+            nn.Linear(hidden * 3 + edge_in, hidden * 2),
             nn.LayerNorm(hidden * 2),
             nn.ReLU(),
             nn.Dropout(dropout + 0.1), # 略微增加 Dropout
@@ -108,11 +109,15 @@ class ROEN_Universal(nn.Module):
             edge_index = graphs[t].edge_index
             src, dst = edge_index[0], edge_index[1]
             
-            # 融合: 深度进化的边 + 双流时序增强的节点
+            raw_edge_attr = getattr(graphs[t], "edge_attr", None)
+            if raw_edge_attr is None:
+                raw_edge_attr = spatial_edge_feats[t].new_zeros((spatial_edge_feats[t].size(0), self.edge_in))
+
             edge_rep = torch.cat([
                 spatial_edge_feats[t], 
                 node_out_t[src], 
-                node_out_t[dst]
+                node_out_t[dst],
+                raw_edge_attr
             ], dim=1)
             
             batch_preds.append(self.classifier(edge_rep))
